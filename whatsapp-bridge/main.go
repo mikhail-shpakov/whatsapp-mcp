@@ -2,13 +2,18 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math"
-	"math/rand"
+	mrand "math/rand"
+	"net"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -16,6 +21,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode"
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mdp/qrterminal"
@@ -49,7 +55,7 @@ type MessageStore struct {
 // Initialize message store
 func NewMessageStore() (*MessageStore, error) {
 	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
+	if err := os.MkdirAll("store", 0700); err != nil {
 		return nil, fmt.Errorf("failed to create store directory: %v", err)
 	}
 
@@ -233,6 +239,15 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 
 	// Check if we have media to send
 	if mediaPath != "" {
+		// Only files placed in the outbox directory may be sent. Without this
+		// check anyone who can reach the API (or a prompt injected into the
+		// assistant through an incoming message) could send any file from disk.
+		resolvedPath, err := resolveOutboxPath(mediaPath)
+		if err != nil {
+			return false, err.Error()
+		}
+		mediaPath = resolvedPath
+
 		// Read media file
 		mediaData, err := os.ReadFile(mediaPath)
 		if err != nil {
@@ -287,8 +302,6 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		if err != nil {
 			return false, fmt.Sprintf("Error uploading media: %v", err)
 		}
-
-		fmt.Println("Media uploaded", resp)
 
 		// Create the appropriate message type based on media type
 		switch mediaType {
@@ -463,9 +476,9 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 
 		// Log based on message type
 		if mediaType != "" {
-			fmt.Printf("[%s] %s %s: [%s: %s] %s\n", timestamp, direction, sender, mediaType, filename, content)
+			fmt.Printf("[%s] %s %s: [%s]\n", timestamp, direction, sender, mediaType)
 		} else if content != "" {
-			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
+			fmt.Printf("[%s] %s %s: [text]\n", timestamp, direction, sender)
 		}
 	}
 }
@@ -562,7 +575,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	var err error
 
 	// First, check if we already have this file
-	chatDir := fmt.Sprintf("store/%s", strings.ReplaceAll(chatJID, ":", "_"))
+	chatDir := filepath.Join("store", "media", safePathComponent(chatJID))
 	localPath := ""
 
 	// Get media info from the database
@@ -586,12 +599,16 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Create directory for the chat if it doesn't exist
-	if err := os.MkdirAll(chatDir, 0755); err != nil {
+	if err := os.MkdirAll(chatDir, 0700); err != nil {
 		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
 	}
 
 	// Generate a local path for the file
-	localPath = fmt.Sprintf("%s/%s", chatDir, filename)
+	// The filename of a received document is chosen by the sender, so it must
+	// never be able to escape the chat directory ("../../.zshrc"). The message
+	// id keeps two attachments with the same name apart.
+	filename = safePathComponent(messageID) + "_" + safePathComponent(filename)
+	localPath = filepath.Join(chatDir, filename)
 
 	// Get absolute path
 	absPath, err := filepath.Abs(localPath)
@@ -611,6 +628,13 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	fmt.Printf("Attempting to download media for message %s in chat %s...\n", messageID, chatJID)
+
+	// The URL comes from the sender's message. Only fetch from WhatsApp's own
+	// media hosts so a crafted message cannot make this machine request an
+	// arbitrary address.
+	if !isWhatsAppMediaURL(url) {
+		return false, "", "", "", fmt.Errorf("refusing to download media from a non-WhatsApp URL")
+	}
 
 	// Extract direct path from URL
 	directPath := extractDirectPathFromURL(url)
@@ -641,13 +665,13 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
 
 	// Save the downloaded media to file
-	if err := os.WriteFile(localPath, mediaData, 0644); err != nil {
+	if err := os.WriteFile(localPath, mediaData, 0600); err != nil {
 		return false, "", "", "", fmt.Errorf("failed to save media file: %v", err)
 	}
 
@@ -676,9 +700,11 @@ func extractDirectPathFromURL(url string) string {
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int, token string) {
+	mux := http.NewServeMux()
+
 	// Handler for sending messages
-	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -703,7 +729,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			return
 		}
 
-		fmt.Println("Received request to send message", req.Message, req.MediaPath)
+		fmt.Println("Received request to send message")
 
 		// Send the message
 		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
@@ -724,7 +750,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Handler for downloading media
-	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -774,14 +800,21 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
-	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
+	// Loopback only: the API can send messages from this number.
+	serverAddr := net.JoinHostPort("127.0.0.1", fmt.Sprintf("%d", port))
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
+
+	server := &http.Server{
+		Addr:              serverAddr,
+		Handler:           requireAPIToken(token, mux),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
 
 	// Run server in a goroutine so it doesn't block
 	go func() {
-		if err := http.ListenAndServe(serverAddr, nil); err != nil {
+		if err := server.ListenAndServe(); err != nil {
 			fmt.Printf("REST API server error: %v\n", err)
+			os.Exit(1)
 		}
 	}()
 }
@@ -795,19 +828,25 @@ func main() {
 	dbLog := waLog.Stdout("Database", "INFO", true)
 
 	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
+	// Everything this process writes (session keys, message history, media)
+	// is private to the current user.
+	syscall.Umask(0077)
+	if err := os.MkdirAll("store", 0700); err != nil {
 		logger.Errorf("Failed to create store directory: %v", err)
 		return
 	}
+	if err := tightenStorePermissions("store"); err != nil {
+		logger.Warnf("Failed to tighten store permissions: %v", err)
+	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -906,7 +945,12 @@ func main() {
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
 	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
+	token, err := loadOrCreateAPIToken(filepath.Join("store", "api_token"))
+	if err != nil {
+		logger.Errorf("Failed to prepare API token: %v", err)
+		return
+	}
+	startRESTServer(client, messageStore, bridgePort(), token)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
@@ -973,7 +1017,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1032,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {
@@ -1072,9 +1116,6 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength = extractMediaInfo(msg.Message.Message)
 				}
 
-				// Log the message content for debugging
-				logger.Infof("Message content: %v, Media Type: %v", content, mediaType)
-
 				// Skip messages with no content and no media
 				if content == "" && mediaType == "" {
 					continue
@@ -1133,11 +1174,11 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					syncedCount++
 					// Log successful message storage
 					if mediaType != "" {
-						logger.Infof("Stored message: [%s] %s -> %s: [%s: %s] %s",
-							timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, mediaType, filename, content)
+						logger.Infof("Stored message: [%s] %s -> %s: [%s]",
+							timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, mediaType)
 					} else {
-						logger.Infof("Stored message: [%s] %s -> %s: %s",
-							timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, content)
+						logger.Debugf("Stored message: [%s] %s -> %s",
+							timestamp.Format("2006-01-02 15:04:05"), sender, chatJID)
 					}
 				}
 			}
@@ -1227,6 +1268,9 @@ func analyzeOggOpus(data []byte) (duration uint32, waveform []byte, err error) {
 		for _, segLen := range segmentTable {
 			pageSize += int(segLen)
 		}
+		if i+pageSize > len(data) {
+			break
+		}
 
 		// Check if we're looking at an OpusHead packet (should be in first few pages)
 		if !foundOpusHead && pageSeqNum <= 1 {
@@ -1238,7 +1282,7 @@ func analyzeOggOpus(data []byte) (duration uint32, waveform []byte, err error) {
 				// OpusHead format: Magic(8) + Version(1) + Channels(1) + PreSkip(2) + SampleRate(4) + ...
 				headPos += 8 // Skip "OpusHead" marker
 				// PreSkip is 2 bytes at offset 10
-				if headPos+12 <= len(pageData) {
+				if headPos+16 <= len(pageData) {
 					preSkip = binary.LittleEndian.Uint16(pageData[headPos+10 : headPos+12])
 					sampleRate = binary.LittleEndian.Uint32(pageData[headPos+12 : headPos+16])
 					foundOpusHead = true
@@ -1306,7 +1350,7 @@ func placeholderWaveform(duration uint32) []byte {
 	waveform := make([]byte, waveformLength)
 
 	// Seed the random number generator for consistent results with the same duration
-	rand.Seed(int64(duration))
+	rng := mrand.New(mrand.NewSource(int64(duration)))
 
 	// Create a more natural looking waveform with some patterns and variability
 	// rather than completely random values
@@ -1325,7 +1369,7 @@ func placeholderWaveform(duration uint32) []byte {
 		val += (baseAmplitude / 2) * math.Sin(pos*math.Pi*frequencyFactor*16)
 
 		// Add some randomness to make it look more natural
-		val += (rand.Float64() - 0.5) * 15
+		val += (rng.Float64() - 0.5) * 15
 
 		// Add some fade-in and fade-out effects
 		fadeInOut := math.Sin(pos * math.Pi)
@@ -1345,4 +1389,185 @@ func placeholderWaveform(duration uint32) []byte {
 	}
 
 	return waveform
+}
+
+// bridgePort returns the REST API port (WHATSAPP_BRIDGE_PORT, default 18431).
+func bridgePort() int {
+	if v := os.Getenv("WHATSAPP_BRIDGE_PORT"); v != "" {
+		var p int
+		if _, err := fmt.Sscanf(v, "%d", &p); err == nil && p > 0 && p < 65536 {
+			return p
+		}
+	}
+	return 18431
+}
+
+// loadOrCreateAPIToken returns the shared secret the MCP server must present.
+// It lives next to the session database, readable only by the current user.
+func loadOrCreateAPIToken(path string) (string, error) {
+	if data, err := os.ReadFile(path); err == nil {
+		token := strings.TrimSpace(string(data))
+		if len(token) >= 32 {
+			return token, nil
+		}
+	}
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	token := hex.EncodeToString(buf)
+	if err := os.WriteFile(path, []byte(token), 0600); err != nil {
+		return "", err
+	}
+	return token, nil
+}
+
+// requireAPIToken rejects requests without the bearer token, without a JSON
+// content type or with an oversized body. A web page can fire a blind request
+// at 127.0.0.1, but it cannot read the token, and a custom Authorization
+// header needs a CORS preflight that this server never answers.
+func requireAPIToken(token string, next http.Handler) http.Handler {
+	expected := []byte("Bearer " + token)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Requests must address the loopback host directly: this blocks DNS
+		// rebinding, where a web page reaches 127.0.0.1 under its own name.
+		host, _, err := net.SplitHostPort(r.Host)
+		if err != nil {
+			host = r.Host
+		}
+		if host != "127.0.0.1" && host != "localhost" {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+		got := []byte(r.Header.Get("Authorization"))
+		if subtle.ConstantTimeCompare(got, expected) != 1 {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if !strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+			http.Error(w, "Content-Type must be application/json", http.StatusUnsupportedMediaType)
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		next.ServeHTTP(w, r)
+	})
+}
+
+// outboxDir is the only directory files may be sent from
+// (WHATSAPP_OUTBOX_DIR, default ~/WhatsAppOutbox).
+func outboxDir() (string, error) {
+	dir := os.Getenv("WHATSAPP_OUTBOX_DIR")
+	if dir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		dir = filepath.Join(home, "WhatsAppOutbox")
+	}
+	dir, err := filepath.Abs(dir)
+	if err != nil {
+		return "", err
+	}
+	// An outbox as wide as the home directory would let almost any file out.
+	if home, herr := os.UserHomeDir(); herr == nil {
+		if dir == "/" || dir == filepath.Clean(home) || strings.HasPrefix(filepath.Clean(home), dir+string(filepath.Separator)) {
+			return "", fmt.Errorf("outbox directory %s is too broad", dir)
+		}
+	}
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", err
+	}
+	return filepath.EvalSymlinks(dir)
+}
+
+// resolveOutboxPath resolves symlinks and returns the real path of a regular
+// file inside the outbox, or an error.
+func resolveOutboxPath(p string) (string, error) {
+	root, err := outboxDir()
+	if err != nil {
+		return "", fmt.Errorf("outbox directory unavailable: %v", err)
+	}
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return "", fmt.Errorf("invalid media path")
+	}
+	real, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", fmt.Errorf("media file not found")
+	}
+	rel, err := filepath.Rel(root, real)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", fmt.Errorf("media file must be inside %s", root)
+	}
+	info, err := os.Stat(real)
+	if err != nil || !info.Mode().IsRegular() {
+		return "", fmt.Errorf("media path is not a regular file")
+	}
+	// A hard link to ~/.ssh/id_rsa placed in the outbox would pass the path
+	// check, so files with more than one link are refused.
+	if st, ok := info.Sys().(*syscall.Stat_t); ok && st.Nlink > 1 {
+		return "", fmt.Errorf("media file has multiple hard links; copy it into the outbox instead")
+	}
+	return real, nil
+}
+
+// safePathComponent turns an attacker-controlled name (a document filename,
+// a chat JID, a message id) into a single harmless path component.
+func safePathComponent(name string) string {
+	var b strings.Builder
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '.', r == '-', r == '_', r == '@', r == ' ', r == '(', r == ')':
+			b.WriteRune(r)
+		case r > 127 && unicode.IsPrint(r) && !unicode.Is(unicode.Bidi_Control, r):
+			// keep non-ASCII letters (Cyrillic names), drop bidi overrides
+			b.WriteRune(r)
+		default:
+			b.WriteRune('_')
+		}
+	}
+	out := strings.Trim(b.String(), ". ")
+	// Filesystems cap names at 255 bytes and the message id prefix needs room;
+	// shorten the stem, keep a short extension so the file still opens.
+	ext := filepath.Ext(out)
+	if len(ext) > 10 {
+		ext = ""
+	}
+	stem := strings.TrimSuffix(out, ext)
+	for len(stem)+len(ext) > 100 {
+		r := []rune(stem)
+		stem = string(r[:len(r)-1])
+	}
+	out = stem + ext
+	if out == "" {
+		out = "file"
+	}
+	return out
+}
+
+// tightenStorePermissions makes files created by older versions private.
+func tightenStorePermissions(dir string) error {
+	return filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil
+		}
+		if info.IsDir() {
+			return os.Chmod(path, 0700)
+		}
+		return os.Chmod(path, 0600)
+	})
+}
+
+// isWhatsAppMediaURL accepts only https URLs on WhatsApp media hosts.
+func isWhatsAppMediaURL(raw string) bool {
+	u, err := neturl.Parse(raw)
+	if err != nil || u.Scheme != "https" || u.User != nil {
+		return false
+	}
+	h := strings.ToLower(u.Hostname())
+	return h == "whatsapp.net" || strings.HasSuffix(h, ".whatsapp.net")
 }

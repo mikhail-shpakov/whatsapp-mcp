@@ -7,8 +7,32 @@ import requests
 import json
 import audio
 
-MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
-WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+STORE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store')
+MESSAGES_DB_PATH = os.path.join(STORE_DIR, 'messages.db')
+API_TOKEN_PATH = os.path.join(STORE_DIR, 'api_token')
+WHATSAPP_API_BASE_URL = f"http://127.0.0.1:{int(os.environ.get('WHATSAPP_BRIDGE_PORT', '18431'))}/api"
+REQUEST_TIMEOUT = 120
+
+
+def _connect_db() -> sqlite3.Connection:
+    """The MCP server only reads the history; the bridge is the only writer."""
+    return sqlite3.connect(f"file:{os.path.abspath(MESSAGES_DB_PATH)}?mode=ro", uri=True)
+
+
+def _api_headers() -> dict:
+    """The bridge refuses requests without the token it keeps in its store."""
+    with open(API_TOKEN_PATH) as f:
+        token = f.read().strip()
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _post(endpoint: str, payload: dict) -> requests.Response:
+    return requests.post(
+        f"{WHATSAPP_API_BASE_URL}/{endpoint}",
+        json=payload,
+        headers=_api_headers(),
+        timeout=REQUEST_TIMEOUT,
+    )
 
 @dataclass
 class Message:
@@ -49,7 +73,7 @@ class MessageContext:
 
 def get_sender_name(sender_jid: str) -> str:
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = _connect_db()
         cursor = conn.cursor()
         
         # First try matching by exact JID
@@ -135,7 +159,7 @@ def list_messages(
 ) -> List[Message]:
     """Get messages matching the specified criteria with optional context."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = _connect_db()
         cursor = conn.cursor()
         
         # Build base query
@@ -230,7 +254,7 @@ def get_message_context(
 ) -> MessageContext:
     """Get context around a specific message."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = _connect_db()
         cursor = conn.cursor()
         
         # Get the target message first
@@ -325,7 +349,7 @@ def list_chats(
 ) -> List[Chat]:
     """Get chats matching the specified criteria."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = _connect_db()
         cursor = conn.cursor()
         
         # Build base query
@@ -393,7 +417,7 @@ def list_chats(
 def search_contacts(query: str) -> List[Contact]:
     """Search contacts by name or phone number."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = _connect_db()
         cursor = conn.cursor()
         
         # Split query into characters to support partial matching
@@ -441,7 +465,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
         page: Page number for pagination (default 0)
     """
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = _connect_db()
         cursor = conn.cursor()
         
         cursor.execute("""
@@ -486,7 +510,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
 def get_last_interaction(jid: str) -> str:
     """Get most recent message involving the contact."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = _connect_db()
         cursor = conn.cursor()
         
         cursor.execute("""
@@ -535,7 +559,7 @@ def get_last_interaction(jid: str) -> str:
 def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]:
     """Get chat metadata by JID."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = _connect_db()
         cursor = conn.cursor()
         
         query = """
@@ -583,7 +607,7 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
 def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
     """Get chat metadata by sender phone number."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = _connect_db()
         cursor = conn.cursor()
         
         cursor.execute("""
@@ -628,13 +652,12 @@ def send_message(recipient: str, message: str) -> Tuple[bool, str]:
         if not recipient:
             return False, "Recipient must be provided"
         
-        url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {
             "recipient": recipient,
             "message": message,
         }
         
-        response = requests.post(url, json=payload)
+        response = _post("send", payload)
         
         # Check if the request was successful
         if response.status_code == 200:
@@ -662,13 +685,12 @@ def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
         if not os.path.isfile(media_path):
             return False, f"Media file not found: {media_path}"
         
-        url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {
             "recipient": recipient,
             "media_path": media_path
         }
         
-        response = requests.post(url, json=payload)
+        response = _post("send", payload)
         
         # Check if the request was successful
         if response.status_code == 200:
@@ -696,19 +718,31 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
         if not os.path.isfile(media_path):
             return False, f"Media file not found: {media_path}"
 
+        if not audio.is_in_outbox(media_path):
+            return False, f"Audio file must be inside {audio.outbox_dir()}"
+
+        converted_path = None
         if not media_path.endswith(".ogg"):
             try:
+                # Only audio from the outbox is converted; the result is
+                # written back to the outbox so the bridge accepts it.
+                if not audio.is_in_outbox(media_path):
+                    return False, f"Audio file must be inside {audio.outbox_dir()}"
                 media_path = audio.convert_to_opus_ogg_temp(media_path)
+                converted_path = media_path
             except Exception as e:
                 return False, f"Error converting file to opus ogg. You likely need to install ffmpeg: {str(e)}"
         
-        url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {
             "recipient": recipient,
             "media_path": media_path
         }
         
-        response = requests.post(url, json=payload)
+        try:
+            response = _post("send", payload)
+        finally:
+            if converted_path and os.path.exists(converted_path):
+                os.unlink(converted_path)
         
         # Check if the request was successful
         if response.status_code == 200:
@@ -735,13 +769,12 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
         The local file path if download was successful, None otherwise
     """
     try:
-        url = f"{WHATSAPP_API_BASE_URL}/download"
         payload = {
             "message_id": message_id,
             "chat_jid": chat_jid
         }
         
-        response = requests.post(url, json=payload)
+        response = _post("download", payload)
         
         if response.status_code == 200:
             result = response.json()

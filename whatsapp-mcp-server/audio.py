@@ -2,6 +2,19 @@ import os
 import subprocess
 import tempfile
 
+
+def outbox_dir() -> str:
+    """Directory the bridge is allowed to send files from (same default as the bridge)."""
+    d = os.environ.get("WHATSAPP_OUTBOX_DIR") or os.path.join(os.path.expanduser("~"), "WhatsAppOutbox")
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    return os.path.realpath(d)
+
+
+def is_in_outbox(path: str) -> bool:
+    root = outbox_dir()
+    real = os.path.realpath(path)
+    return os.path.commonpath([root, real]) == root and real != root and os.path.isfile(real)
+
 def convert_to_opus_ogg(input_file, output_file=None, bitrate="32k", sample_rate=24000):
     """
     Convert an audio file to Opus format in an Ogg container.
@@ -33,9 +46,13 @@ def convert_to_opus_ogg(input_file, output_file=None, bitrate="32k", sample_rate
         os.makedirs(output_dir)
     
     # Build the ffmpeg command
+    # "file:" keeps a name that starts with "-" from being read as an ffmpeg option
     cmd = [
         "ffmpeg",
-        "-i", input_file,
+        "-nostdin",
+        # plain local files only: no concat/HLS playlists pulling in other paths
+        "-protocol_whitelist", "file",
+        "-i", "file:" + os.path.abspath(input_file),
         "-c:a", "libopus",
         "-b:a", bitrate,
         "-ar", str(sample_rate),
@@ -44,7 +61,7 @@ def convert_to_opus_ogg(input_file, output_file=None, bitrate="32k", sample_rate
         "-compression_level", "10",  # Maximum compression
         "-frame_duration", "60",     # 60ms frames (good for voice)
         "-y",                        # Overwrite output file if it exists
-        output_file
+        "file:" + os.path.abspath(output_file)
     ]
     
     try:
@@ -54,9 +71,12 @@ def convert_to_opus_ogg(input_file, output_file=None, bitrate="32k", sample_rate
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            check=True
+            check=True,
+            timeout=120,
         )
         return output_file
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("Audio conversion took longer than 120 seconds")
     except subprocess.CalledProcessError as e:
         raise RuntimeError(f"Failed to convert audio. You likely need to install ffmpeg {e.stderr}")
 
@@ -78,7 +98,7 @@ def convert_to_opus_ogg_temp(input_file, bitrate="32k", sample_rate=24000):
         RuntimeError: If the ffmpeg conversion fails
     """
     # Create a temporary file with .ogg extension
-    temp_file = tempfile.NamedTemporaryFile(suffix=".ogg", delete=False)
+    temp_file = tempfile.NamedTemporaryFile(suffix=".ogg", delete=False, dir=outbox_dir())
     temp_file.close()
     
     try:
