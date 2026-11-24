@@ -358,11 +358,13 @@ def list_chats(
                 chats.jid,
                 chats.name,
                 chats.last_message_time,
-                messages.content as last_message,
-                messages.sender as last_sender,
-                messages.is_from_me as last_is_from_me
+                {last_cols}
             FROM chats
-        """]
+        """.format(last_cols=(
+            "messages.content as last_message, messages.sender as last_sender, messages.is_from_me as last_is_from_me"
+            if include_last_message else
+            "NULL as last_message, NULL as last_sender, NULL as last_is_from_me"
+        ))]
         
         if include_last_message:
             query_parts.append("""
@@ -672,6 +674,25 @@ def send_message(recipient: str, message: str) -> Tuple[bool, str]:
         return False, f"Error parsing response: {response.text}"
     except Exception as e:
         return False, f"Unexpected error: {str(e)}"
+
+def send_to_self(message: str, media_path: Optional[str] = None) -> Tuple[bool, str]:
+    """Send to the account's own "Message yourself" chat; the bridge fixes the recipient."""
+    try:
+        if not message and not media_path:
+            return False, "Message or media path must be provided"
+        payload = {"message": message or ""}
+        if media_path:
+            payload["media_path"] = media_path
+        response = _post("send-self", payload)
+        if response.status_code == 200:
+            result = response.json()
+            return result.get("success", False), result.get("message", "Unknown response")
+        return False, f"Error: HTTP {response.status_code} - {response.text}"
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
+
 
 def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
     try:

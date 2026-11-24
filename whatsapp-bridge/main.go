@@ -749,6 +749,58 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Handler for sending to the account's own "Message yourself" chat. The
+	// recipient is fixed here, not taken from the request, so this endpoint can
+	// never reach another person: it is a safe place for drafts.
+	mux.HandleFunc("/api/send-self", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req struct {
+			Message   string `json:"message"`
+			MediaPath string `json:"media_path,omitempty"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if req.Message == "" && req.MediaPath == "" {
+			http.Error(w, "Message or media path is required", http.StatusBadRequest)
+			return
+		}
+		if client.Store.ID == nil {
+			http.Error(w, "Not logged in", http.StatusServiceUnavailable)
+			return
+		}
+
+		self := types.NewJID(client.Store.ID.User, types.DefaultUserServer).String()
+		fmt.Println("Received request to send a message to self")
+		text, media := req.Message, req.MediaPath
+		// Voice messages carry no caption: send the text on its own first so
+		// the draft is not lost.
+		if media != "" && text != "" && strings.EqualFold(filepath.Ext(media), ".ogg") {
+			if ok, msg := sendWhatsAppMessage(client, self, text, ""); !ok {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: msg})
+				return
+			}
+			text = ""
+		}
+		success, message := sendWhatsAppMessage(client, self, text, media)
+		if success {
+			message = "Message sent to your own chat"
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if !success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		json.NewEncoder(w).Encode(SendMessageResponse{Success: success, Message: message})
+	})
+
 	// Handler for downloading media
 	mux.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests

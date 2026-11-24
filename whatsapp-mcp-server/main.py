@@ -10,6 +10,7 @@ from whatsapp import (
     get_last_interaction as whatsapp_get_last_interaction,
     get_message_context as whatsapp_get_message_context,
     send_message as whatsapp_send_message,
+    send_to_self as whatsapp_send_to_self,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
     download_media as whatsapp_download_media
@@ -182,6 +183,21 @@ def send_message(
         "success": success,
         "message": status_message
     }
+
+@mcp.tool()
+def send_to_self(message: str, media_path: Optional[str] = None) -> Dict[str, Any]:
+    """Save a draft: send a message to the user's own WhatsApp chat ("Message yourself").
+
+    The recipient is always the user's own number and cannot be changed, so this
+    never reaches anyone else. Use it to prepare a text the user will copy and
+    send to someone themselves.
+
+    Args:
+        message: The text of the draft (also used as the caption if a file is attached)
+        media_path: Optional absolute path to a file inside ~/WhatsAppOutbox to attach
+    """
+    success, status_message = whatsapp_send_to_self(message, media_path)
+    return {"success": success, "message": status_message}
 
 @mcp.tool()
 def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
